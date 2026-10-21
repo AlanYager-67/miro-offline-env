@@ -1,0 +1,433 @@
+name: Build MIRO offline GPU environment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: miro-offline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Re-audit before changing the project, commit, platform or main versions.
+  PROJECT_REPO: DeepTrackAI/MIRO
+  PROJECT_REF: default
+  AUDITED_COMMIT: ed2b318b8015f47c47841b18c55a9fea8ef83982
+  PYTHON_VERSION: '3.11'
+  TORCH_VERSION: '2.5.1'
+  TORCHVISION_VERSION: '0.20.1'
+  CUDA_BUILD: cu124
+  CUDA_RUNTIME: '12.4'
+  MINIFORGE_VERSION: '25.3.1-0'
+  CONDA_PACK_VERSION: '0.8.1'
+  ARCHIVE_NAME: miro-runtime-linux-x86_64.tar.gz
+  RUNTIME_REQUIREMENTS: |
+    numpy==1.26.4
+    matplotlib==3.9.2
+    lightning==2.4.0
+    pytorch-lightning==2.4.0
+    torchmetrics==1.4.3
+    torch-geometric==2.6.1
+    kornia==0.7.3
+    kornia-rs==0.1.7
+    scipy==1.14.1
+    scikit-image==0.24.0
+    scikit-learn==1.5.2
+    rich==13.9.4
+    dill==0.3.9
+    pandas==2.2.3
+    tqdm==4.67.1
+    requests==2.32.3
+  PIP_CONFIG_FILE: /dev/null
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  PIP_NO_CACHE_DIR: '1'
+  PYTHONNOUSERSITE: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check platform and workspace
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          . /etc/os-release
+          test "$ID:$VERSION_ID" = ubuntu:24.04
+          test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.39'
+          df -h "$RUNNER_TEMP"
+          available=$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          if (( available < 11 * 1024 * 1024 * 1024 )); then
+            echo 'Insufficient free disk space: need at least 11 GiB.' >&2
+            exit 1
+          fi
+          work="$RUNNER_TEMP/miro-offline"
+          mkdir -p "$work/tmp" "$work/pkgs" "$work/out"
+          {
+            echo "MIRO_WORK=$work"
+            echo "BUILD_PREFIX=$work/env"
+            echo "BOOT_PREFIX=$work/miniforge"
+            echo "CONDA_PKGS_DIRS=$work/pkgs"
+            echo "TMPDIR=$work/tmp"
+          } >> "$GITHUB_ENV"
+
+      - name: Audit upstream text files without downloading resources
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, concurrent.futures, hashlib, json, os, re
+          import urllib.parse, urllib.request
+          from pathlib import Path
+
+          repo = os.environ['PROJECT_REPO']
+          assert re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)
+          api_root = 'https://api.github.com/repos/' + repo
+          def api(path):
+              req = urllib.request.Request(api_root + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'User-Agent': 'miro-environment-audit',
+              })
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+
+          metadata = api('')
+          ref = metadata['default_branch'] if os.environ['PROJECT_REF'] == 'default' else os.environ['PROJECT_REF']
+          commit = api('/commits/' + urllib.parse.quote(ref, safe=''))['sha']
+          print('Resolved upstream:', repo, ref, commit, flush=True)
+          if commit != os.environ['AUDITED_COMMIT']:
+              raise SystemExit('Default branch changed. Re-audit the new commit before updating this recipe.')
+          tree = api('/git/trees/' + commit + '?recursive=1')
+          assert not tree.get('truncated'), 'Repository tree was truncated'
+          entries = tree['tree']
+          assert not any(e['mode'] == '160000' for e in entries), 'Unexpected submodule'
+          configs = [e['path'] for e in entries if e['path'].split('/')[-1] in
+                     {'setup.py', 'setup.cfg', 'pyproject.toml', '.gitmodules', '.gitattributes'}]
+          assert not configs, ('New installation/LFS configuration requires review', configs)
+          assert not any(e['path'].endswith(('.cu', '.cpp', '.cc', '.pyx')) for e in entries)
+          def needed(e):
+              p = e['path']
+              if e['type'] != 'blob':
+                  return False
+              if p in {'README.md', 'requirements.txt'} or p.endswith('.ipynb'):
+                  return True
+              return p.endswith('.py') and not any(
+                  part in {'test', 'tests'} or part.startswith('test_') for part in p.split('/'))
+          selected = [e for e in entries if needed(e)]
+          def inspect(e):
+              blob = api('/git/blobs/' + e['sha'])
+              assert blob['encoding'] == 'base64'
+              raw = base64.b64decode(blob['content'])
+              actual = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              assert actual == e['sha']
+              text = raw.decode('utf-8-sig')
+              assert not text.startswith('version https://git-lfs.github.com/spec/v1')
+              if e['path'] == 'requirements.txt':
+                  assert text.split() == ('numpy matplotlib torch>2.3 lightning torchmetrics torchvision '
+                      'torch-geometric kornia scipy scikit-image rich dill pandas tqdm sklearn').split()
+              return {'path': e['path'], 'git_blob': e['sha'], 'sha256': hashlib.sha256(raw).hexdigest()}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+              records = list(pool.map(inspect, selected))
+          audit = {'repository': repo, 'ref': ref, 'commit': commit,
+                   'local_packages': ['deeplay', 'lib'], 'submodules': [], 'lfs_configuration': [],
+                   'install_configuration': configs, 'text_files': records,
+                   'resource_download_entry': 'lib.download.sdownload; not called',
+                   'notebook_progress': 'Use tqdm.tqdm instead of tqdm.tqdm_notebook in CLI scripts'}
+          Path(os.environ['MIRO_WORK'], 'source-audit.json').write_text(json.dumps(audit, indent=2) + '\n')
+          print('SOURCE_AUDIT_OK:', len(records), 'text files; no source retained')
+          PY
+
+      - name: Create Conda environment and install binary dependencies
+        run: |
+          set -euo pipefail
+          unset PYTHONHOME PYTHONPATH
+          cd "$MIRO_WORK"
+          installer="Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh"
+          url="https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}"
+          curl -fL --retry 5 -o "$installer" "$url/$installer"
+          curl -fL --retry 5 -o "$installer.sha256" "$url/$installer.sha256"
+          sha256sum -c "$installer.sha256"
+          bash "$installer" -b -p "$BOOT_PREFIX"
+          rm "$installer" "$installer.sha256"
+          "$BOOT_PREFIX/bin/python" -m pip install --only-binary=:all: \
+            --index-url https://pypi.org/simple "conda-pack==$CONDA_PACK_VERSION"
+          "$BOOT_PREFIX/bin/conda" create -y --copy -p "$BUILD_PREFIX" \
+            --override-channels -c conda-forge --strict-channel-priority \
+            "python=$PYTHON_VERSION" 'pip=25.0.1' 'setuptools=75.8.0' 'wheel=0.45.1' \
+            libgcc-ng libstdcxx-ng libgomp
+          mkdir -p "$BUILD_PREFIX/_offline"
+          cp source-audit.json "$BUILD_PREFIX/_offline/"
+          {
+            echo "torch==${TORCH_VERSION}+${CUDA_BUILD}"
+            echo "torchvision==${TORCHVISION_VERSION}+${CUDA_BUILD}"
+            printf '%s\n' "$RUNTIME_REQUIREMENTS"
+          } > "$BUILD_PREFIX/_offline/requirements-direct.txt"
+          "$BUILD_PREFIX/bin/python" -m pip install --only-binary=:all: --no-compile \
+            --index-url https://pypi.org/simple \
+            --extra-index-url "https://download.pytorch.org/whl/$CUDA_BUILD" \
+            --report "$BUILD_PREFIX/_offline/pip-install-report.json" \
+            -r "$BUILD_PREFIX/_offline/requirements-direct.txt"
+          "$BOOT_PREFIX/bin/conda" list -p "$BUILD_PREFIX" --explicit \
+            > "$BUILD_PREFIX/_offline/conda-explicit.txt"
+          "$BUILD_PREFIX/bin/python" -m pip freeze --all > "$BUILD_PREFIX/_offline/pip-freeze.txt"
+          "$BOOT_PREFIX/bin/conda" clean --tarballs --index-cache -y
+          df -h "$MIRO_WORK"
+
+      - name: Generate portable activation and verification scripts
+        run: |
+          set -euo pipefail
+          cat > "$BUILD_PREFIX/_offline/activate.sh" <<'SH'
+          # Source this file from Bash after the first conda-unpack.
+          _miro_prefix="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+          unset PYTHONHOME PYTHONPATH LD_PRELOAD CUDA_HOME CUDA_PATH
+          source "$_miro_prefix/bin/activate"
+          export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+          export PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1 CONDA_OFFLINE=true
+          export MPLBACKEND=Agg
+          export MPLCONFIGDIR="${XDG_CACHE_HOME:-$HOME/.cache}/miro/matplotlib"
+          mkdir -p "$MPLCONFIGDIR"
+          _miro_site="$_miro_prefix/lib/python3.11/site-packages"
+          _miro_libs="$_miro_prefix/lib:$_miro_site/torch/lib"
+          for _miro_dir in "$_miro_site"/nvidia/*/lib; do
+            if [[ -d "$_miro_dir" ]]; then _miro_libs="$_miro_libs:$_miro_dir"; fi
+          done
+          # System driver libraries remain discoverable through ldconfig.
+          export LD_LIBRARY_PATH="$_miro_libs"
+          unset _miro_prefix _miro_site _miro_libs _miro_dir
+          SH
+
+          cat > "$BUILD_PREFIX/_offline/verify.py" <<'PY'
+          import argparse, importlib, importlib.metadata, io, json, platform, socket, sys
+          from pathlib import Path
+          def no_network(*args, **kwargs):
+              raise RuntimeError('Network is forbidden during validation')
+          socket.socket.connect = no_network
+          socket.socket.connect_ex = no_network
+          socket.create_connection = no_network
+          parser = argparse.ArgumentParser()
+          parser.add_argument('--gpu', action='store_true')
+          args = parser.parse_args()
+          assert platform.machine() == 'x86_64'
+          assert platform.libc_ver()[1] == '2.39'
+          config = json.loads(Path(__file__).with_name('build.json').read_text())
+          assert '.'.join(map(str, sys.version_info[:2])) == config['python_series']
+          modules = ['numpy', 'matplotlib', 'torch', 'torchvision', 'lightning',
+                     'pytorch_lightning', 'torchmetrics', 'torch_geometric', 'kornia',
+                     'kornia_rs', 'scipy', 'skimage', 'sklearn', 'rich', 'dill',
+                     'pandas', 'tqdm', 'requests']
+          for name in modules:
+              importlib.import_module(name)
+          import numpy as np
+          import torch, torchvision, kornia, dill, pandas as pd
+          from lightning.fabric.utilities.types import _PATH
+          from lightning.pytorch.trainer.connectors.callback_connector import _CallbackConnector
+          from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
+          from sklearn.cluster import DBSCAN
+          from skimage.filters import gaussian
+          from torch_geometric.data import Data
+          from torch_geometric.transforms import AddLaplacianEigenvectorPE
+          from torch_geometric.utils import scatter
+          import matplotlib.pyplot as plt
+          assert torch.__version__ == config['torch']
+          assert torchvision.__version__ == config['torchvision']
+          assert torch.version.cuda == config['cuda_runtime']
+          assert hasattr(_CallbackConnector, '_configure_progress_bar')
+          torch.set_num_threads(2)
+          x = torch.from_numpy(np.arange(16, dtype=np.float32).reshape(4, 4))
+          assert torch.allclose(x @ x.T, torch.tensor(np.asarray(x) @ np.asarray(x).T))
+          n = 12
+          src = torch.arange(n)
+          dst = (src + 1) % n
+          edge_index = torch.stack([torch.cat([src, dst]), torch.cat([dst, src])])
+          graph = AddLaplacianEigenvectorPE(2, is_undirected=True)(Data(edge_index=edge_index, num_nodes=n))
+          assert graph.laplacian_eigenvector_pe.shape == (n, 2)
+          assert scatter(torch.ones(n), dst, dim=0, dim_size=n, reduce='sum').sum().item() == n
+          boxes = torch.tensor([[0., 0., 2., 2.], [0., 0., 2., 2.], [5., 5., 6., 6.]])
+          scores = torch.tensor([0.9, 0.8, 0.7])
+          assert torchvision.ops.nms(boxes, scores, 0.5).tolist() == [0, 2]
+          assert kornia.filters.gaussian_blur2d(torch.ones(1, 1, 8, 8), (3, 3), (1., 1.)).shape == (1, 1, 8, 8)
+          assert len(DBSCAN(eps=0.2, min_samples=1).fit_predict([[0., 0.], [1., 1.]])) == 2
+          assert gaussian(np.zeros((4, 4))).shape == (4, 4)
+          assert pd.DataFrame({'x': [1, 2]}).x.sum() == 3
+          assert dill.loads(dill.dumps({'x': 1})) == {'x': 1}
+          fig, ax = plt.subplots()
+          ax.plot([0, 1], [0, 1])
+          fig.savefig(io.BytesIO(), format='png')
+          plt.close(fig)
+          print('DEPENDENCIES_CPU_OK', sys.version.split()[0], torch.__version__, 'CUDA build', torch.version.cuda)
+          if args.gpu:
+              assert torch.cuda.is_available(), 'CUDA is unavailable'
+              assert torch.cuda.device_count() > 0, 'No allocated GPU is visible'
+              for index in range(torch.cuda.device_count()):
+                  device = torch.device('cuda', index)
+                  a = torch.arange(64, dtype=torch.float32, device=device).reshape(8, 8)
+                  assert torch.allclose(a @ a.T, (a.cpu() @ a.cpu().T).to(device))
+                  image = torch.ones(1, 2, 8, 8, device=device)
+                  kernel = torch.ones(3, 2, 3, 3, device=device)
+                  conv = torch.nn.functional.conv2d(image, kernel)
+                  assert torch.allclose(conv, torch.full_like(conv, 18))
+                  assert torchvision.ops.nms(boxes.to(device), scores.to(device), 0.5).cpu().tolist() == [0, 2]
+                  reduced = scatter(torch.ones(n, device=device), dst.to(device), dim=0, dim_size=n, reduce='sum')
+                  assert reduced.sum().item() == n
+                  torch.cuda.synchronize(device)
+                  print('GPU_OK', index, torch.cuda.get_device_name(index), torch.cuda.get_device_capability(index))
+              print('GPU_ALL_OK')
+          PY
+
+          cat > "$BUILD_PREFIX/_offline/check-native.py" <<'PY'
+          import json, os, re, shutil, subprocess, sys
+          from pathlib import Path
+          prefix = Path(sys.prefix).resolve()
+          old = os.environ.get('MIRO_OLD_PREFIX', '')
+          glibc = {'libc.so.6', 'libm.so.6', 'libpthread.so.0', 'libdl.so.2',
+                   'librt.so.1', 'libutil.so.1', 'libresolv.so.2', 'libanl.so.1',
+                   'ld-linux-x86-64.so.2'}
+          drivers = {'libcuda.so.1', 'libnvidia-ml.so.1', 'libnvidia-ptxjitcompiler.so.1'}
+          errors, external, seen = [], set(), set()
+          for p in prefix.rglob('*'):
+              if p.is_symlink():
+                  target = p.resolve()
+                  if not target.is_relative_to(prefix):
+                      errors.append(f'External symlink: {p.relative_to(prefix)} -> {target}')
+              if not p.is_file():
+                  continue
+              rel = str(p.relative_to(prefix))
+              if p.suffix == '.egg-link' or p.name.startswith('__editable__'):
+                  errors.append('Editable installation: ' + rel)
+              if p.name == 'direct_url.json':
+                  data = json.loads(p.read_text())
+                  if data.get('url', '').startswith('file:') or data.get('dir_info', {}).get('editable'):
+                      errors.append('Local installation reference: ' + rel)
+              with p.open('rb') as f:
+                  head = f.read(4096)
+              if old and p.name != 'conda-unpack' and (rel.startswith('bin/') or p.suffix == '.pth'):
+                  if old.encode() in head:
+                      errors.append('Old runtime prefix: ' + rel)
+              if head[:4] != b'\x7fELF' or p.resolve() in seen:
+                  continue
+              seen.add(p.resolve())
+              if shutil.which('readelf') and old:
+                  dynamic = subprocess.run(['readelf', '-d', str(p)], capture_output=True, text=True).stdout
+                  if any(old in line for line in dynamic.splitlines() if 'RPATH' in line or 'RUNPATH' in line):
+                      errors.append('Old ELF search path: ' + rel)
+              linked = subprocess.run(['ldd', str(p)], capture_output=True, text=True)
+              for line in linked.stdout.splitlines():
+                  missing = re.match(r'\s*(\S+)\s+=>\s+not found', line)
+                  if missing and missing[1] not in drivers:
+                      errors.append(rel + ': ' + line.strip())
+                  resolved = re.search(r'=>\s+(/\S+)', line)
+                  if resolved:
+                      target = Path(resolved[1]).resolve()
+                      if not target.is_relative_to(prefix) and resolved[1].split('/')[-1] not in glibc | drivers:
+                          errors.append(rel + ': unexpected system dependency ' + str(target))
+                      elif not target.is_relative_to(prefix):
+                          external.add(resolved[1].split('/')[-1])
+          if errors:
+              raise SystemExit('\n'.join(sorted(set(errors))))
+          print('NATIVE_LIBS_OK; external OS/driver libraries:', ', '.join(sorted(external)))
+          PY
+
+          "$BUILD_PREFIX/bin/python" - <<'PY'
+          import json, os, platform, sys
+          from pathlib import Path
+          p = Path(sys.prefix, '_offline', 'build.json')
+          p.write_text(json.dumps({
+              'project_commit': os.environ['AUDITED_COMMIT'],
+              'python_series': os.environ['PYTHON_VERSION'], 'python_actual': sys.version,
+              'torch': os.environ['TORCH_VERSION'] + '+' + os.environ['CUDA_BUILD'],
+              'torchvision': os.environ['TORCHVISION_VERSION'] + '+' + os.environ['CUDA_BUILD'],
+              'cuda_runtime': os.environ['CUDA_RUNTIME'], 'target_gpu': 'NVIDIA A40 / sm_86',
+              'os': 'Ubuntu 24.04 x86_64', 'glibc': platform.libc_ver()[1],
+              'conda_pack': os.environ['CONDA_PACK_VERSION'], 'gpu_tested_on_runner': False,
+          }, indent=2) + '\n')
+          PY
+
+      - name: Offline dependency and CPU checks
+        run: |
+          set -euo pipefail
+          source "$BUILD_PREFIX/_offline/activate.sh"
+          python -m pip check
+          python "$BUILD_PREFIX/_offline/verify.py"
+          python "$BUILD_PREFIX/_offline/check-native.py"
+
+      - name: Pack and test relocation without keeping two environments
+        run: |
+          set -euo pipefail
+          export PATH="$BOOT_PREFIX/bin:$PATH"
+          "$BOOT_PREFIX/bin/conda-pack" -p "$BUILD_PREFIX" \
+            -o "$MIRO_WORK/out/$ARCHIVE_NAME" --format tar.gz \
+            --compress-level 4 --n-threads 2 --exclude '*.pyc' --exclude '*.pyo'
+          rm -rf -- "$BUILD_PREFIX"
+          "$BOOT_PREFIX/bin/conda" clean --all -y
+          moved="$MIRO_WORK/relocation-check"
+          mkdir "$moved"
+          tar -xzf "$MIRO_WORK/out/$ARCHIVE_NAME" -C "$moved"
+          unset PYTHONHOME PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD
+          source "$moved/bin/activate"
+          python "$moved/bin/conda-unpack"
+          source "$moved/_offline/activate.sh"
+          python -m pip check
+          python "$moved/_offline/verify.py"
+          MIRO_OLD_PREFIX="$BUILD_PREFIX" python "$moved/_offline/check-native.py"
+          echo RELOCATION_OK
+          cd "$MIRO_WORK/out"
+          rm -rf -- "$moved"
+          df -h .
+
+      - name: Publish verified archive to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$MIRO_WORK/out"
+          whole_sha=$(sha256sum "$ARCHIVE_NAME" | awk '{print $1}')
+          size=$(stat -c %s "$ARCHIVE_NAME")
+          assets=("$ARCHIVE_NAME")
+          if (( size >= 2147483648 )); then
+            split -b 1992294400 -d -a 3 "$ARCHIVE_NAME" "$ARCHIVE_NAME.part"
+            rm "$ARCHIVE_NAME"
+            assets=("$ARCHIVE_NAME".part[0-9][0-9][0-9])
+          fi
+          notes="$MIRO_WORK/release-notes.md"
+          {
+            echo "Upstream: https://github.com/$PROJECT_REPO/commit/$AUDITED_COMMIT"
+            echo
+            echo "Python $PYTHON_VERSION; PyTorch $TORCH_VERSION+$CUDA_BUILD; CUDA runtime $CUDA_RUNTIME."
+            echo 'Dependency imports, CPU calculations, native-library and relocation checks passed in this Actions run.'
+            echo 'GPU validation has NOT been performed. No project source, data, models or weights included.'
+            echo "Whole archive size: $size bytes. Uploaded assets: ${#assets[@]}."
+            echo
+            echo 'Copy EVERY line below into SHA256SUMS on the server (the first line is the reassembled archive):'
+            echo '```text'
+            printf '%s  %s\n' "$whole_sha" "$ARCHIVE_NAME"
+            if (( ${#assets[@]} > 1 )); then sha256sum "${assets[@]}"; fi
+            echo '```'
+            echo
+            echo 'No outer ZIP. For split assets, verify parts, concatenate in numerical order, then verify the whole archive.'
+          } > "$notes"
+          tag="miro-env-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --title "MIRO offline GPU environment $tag" --notes-file "$notes"
+          for asset in "${assets[@]}"; do
+            uploaded=false
+            for attempt in 1 2 3; do
+              if gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber; then
+                uploaded=true
+                break
+              fi
+            done
+            test "$uploaded" = true
+          done
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
+          printf '\nRelease: https://github.com/%s/releases/tag/%s\n' "$GITHUB_REPOSITORY" "$tag" \
+            >> "$GITHUB_STEP_SUMMARY"
+          echo RELEASE_READY
