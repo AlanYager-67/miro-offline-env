@@ -23,6 +23,12 @@ env:
   MINIFORGE_VERSION: '25.3.1-0'
   CONDA_PACK_VERSION: '0.8.1'
   ARCHIVE_NAME: miro-runtime-linux-x86_64.tar.gz
+
+  # X11 client libraries complete the Tk dependency shipped with Conda Python.
+  CONDA_RUNTIME_PACKAGES: >-
+    libgcc-ng libstdcxx-ng libgomp
+    xorg-libx11 libxcb xorg-libxau xorg-libxdmcp
+
   RUNTIME_REQUIREMENTS: |
     numpy==1.26.4
     matplotlib==3.9.2
@@ -40,6 +46,7 @@ env:
     pandas==2.2.3
     tqdm==4.67.1
     requests==2.32.3
+
   PIP_CONFIG_FILE: /dev/null
   PIP_DISABLE_PIP_VERSION_CHECK: '1'
   PIP_NO_CACHE_DIR: '1'
@@ -53,22 +60,27 @@ jobs:
     defaults:
       run:
         shell: bash
+
     steps:
       - name: Check platform and workspace
         run: |
           set -euo pipefail
+
           test "$(uname -m)" = x86_64
           . /etc/os-release
           test "$ID:$VERSION_ID" = ubuntu:24.04
           test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.39'
+
           df -h "$RUNNER_TEMP"
           available=$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
           if (( available < 11 * 1024 * 1024 * 1024 )); then
             echo 'Insufficient free disk space: need at least 11 GiB.' >&2
             exit 1
           fi
+
           work="$RUNNER_TEMP/miro-offline"
           mkdir -p "$work/tmp" "$work/pkgs" "$work/out"
+
           {
             echo "MIRO_WORK=$work"
             echo "BUILD_PREFIX=$work/env"
@@ -82,9 +94,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
-          import base64, concurrent.futures, hashlib, json, os, re
-          import urllib.parse, urllib.request
+          import base64
+          import concurrent.futures
+          import hashlib
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
           from pathlib import Path
 
           repo = os.environ['PROJECT_REPO']
@@ -101,27 +120,45 @@ jobs:
                   return json.load(response)
 
           metadata = api('')
-          ref = metadata['default_branch'] if os.environ['PROJECT_REF'] == 'default' else os.environ['PROJECT_REF']
-          commit = api('/commits/' + urllib.parse.quote(ref, safe=''))['sha']
+          ref = (
+              metadata['default_branch']
+              if os.environ['PROJECT_REF'] == 'default'
+              else os.environ['PROJECT_REF']
+          )
+          commit = api(
+              '/commits/' + urllib.parse.quote(ref, safe='')
+          )['sha']
+
           print('Resolved upstream:', repo, ref, commit, flush=True)
 
           if commit != os.environ['AUDITED_COMMIT']:
-              raise SystemExit('Default branch changed. Re-audit the new commit before updating this recipe.')
+              raise SystemExit(
+                  'Default branch changed. Re-audit the new commit before updating this recipe.'
+              )
 
           tree = api('/git/trees/' + commit + '?recursive=1')
           assert not tree.get('truncated'), 'Repository tree was truncated'
           entries = tree['tree']
-          assert not any(e['mode'] == '160000' for e in entries), 'Unexpected submodule'
+
+          assert not any(
+              e['mode'] == '160000' for e in entries
+          ), 'Unexpected submodule'
 
           configs = [
               e['path'] for e in entries
               if e['path'].split('/')[-1] in {
                   'setup.py', 'setup.cfg', 'pyproject.toml',
-                  '.gitmodules', '.gitattributes'
+                  '.gitmodules', '.gitattributes',
               }
           ]
-          assert not configs, ('New installation/LFS configuration requires review', configs)
-          assert not any(e['path'].endswith(('.cu', '.cpp', '.cc', '.pyx')) for e in entries)
+          assert not configs, (
+              'New installation/LFS configuration requires review',
+              configs,
+          )
+          assert not any(
+              e['path'].endswith(('.cu', '.cpp', '.cc', '.pyx'))
+              for e in entries
+          )
 
           def needed(e):
               p = e['path']
@@ -140,13 +177,16 @@ jobs:
               blob = api('/git/blobs/' + e['sha'])
               assert blob['encoding'] == 'base64'
               raw = base64.b64decode(blob['content'])
+
               actual = hashlib.sha1(
                   b'blob ' + str(len(raw)).encode() + b'\0' + raw
               ).hexdigest()
               assert actual == e['sha']
 
               text = raw.decode('utf-8-sig')
-              assert not text.startswith('version https://git-lfs.github.com/spec/v1')
+              assert not text.startswith(
+                  'version https://git-lfs.github.com/spec/v1'
+              )
 
               if e['path'] == 'requirements.txt':
                   assert text.split() == (
@@ -175,9 +215,11 @@ jobs:
               'resource_download_entry': 'lib.download.sdownload; not called',
               'notebook_progress': 'Use tqdm.tqdm instead of tqdm.tqdm_notebook in CLI scripts',
           }
+
           Path(os.environ['MIRO_WORK'], 'source-audit.json').write_text(
               json.dumps(audit, indent=2) + '\n'
           )
+
           print('SOURCE_AUDIT_OK:', len(records), 'text files; no source retained')
           PY
 
@@ -185,8 +227,8 @@ jobs:
         run: |
           set -euo pipefail
           unset PYTHONHOME PYTHONPATH
-          cd "$MIRO_WORK"
 
+          cd "$MIRO_WORK"
           installer="Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh"
           url="https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}"
 
@@ -201,13 +243,15 @@ jobs:
             --index-url https://pypi.org/simple \
             "conda-pack==$CONDA_PACK_VERSION"
 
+          read -r -a conda_runtime <<< "$CONDA_RUNTIME_PACKAGES"
+
           "$BOOT_PREFIX/bin/conda" create -y --copy -p "$BUILD_PREFIX" \
             --override-channels -c conda-forge --strict-channel-priority \
             "python=$PYTHON_VERSION" \
             'pip=25.0.1' \
             'setuptools=75.8.0' \
             'wheel=0.45.1' \
-            libgcc-ng libstdcxx-ng libgomp
+            "${conda_runtime[@]}"
 
           mkdir -p "$BUILD_PREFIX/_offline"
           cp source-audit.json "$BUILD_PREFIX/_offline/"
@@ -227,7 +271,8 @@ jobs:
           "$BOOT_PREFIX/bin/conda" list -p "$BUILD_PREFIX" --explicit \
             > "$BUILD_PREFIX/_offline/conda-explicit.txt"
 
-          "$BUILD_PREFIX/bin/python" -m pip freeze --all \
+          # Name==version inventory avoids build-origin URLs in Conda pip metadata.
+          "$BUILD_PREFIX/bin/python" -m pip list --format=freeze \
             > "$BUILD_PREFIX/_offline/pip-freeze.txt"
 
           "$BOOT_PREFIX/bin/conda" clean --tarballs --index-cache -y
@@ -272,7 +317,6 @@ jobs:
           cat > "$BUILD_PREFIX/_offline/verify.py" <<'PY'
           import argparse
           import importlib
-          import importlib.metadata
           import io
           import json
           import platform
@@ -298,10 +342,11 @@ jobs:
           assert '.'.join(map(str, sys.version_info[:2])) == config['python_series']
 
           modules = [
-              'numpy', 'matplotlib', 'torch', 'torchvision', 'lightning',
-              'pytorch_lightning', 'torchmetrics', 'torch_geometric', 'kornia',
-              'kornia_rs', 'scipy', 'skimage', 'sklearn', 'rich', 'dill',
-              'pandas', 'tqdm', 'requests',
+              '_tkinter', 'numpy', 'matplotlib', 'torch', 'torchvision',
+              'lightning', 'pytorch_lightning', 'torchmetrics',
+              'torch_geometric', 'kornia', 'kornia_rs', 'scipy',
+              'skimage', 'sklearn', 'rich', 'dill', 'pandas', 'tqdm',
+              'requests',
           ]
           for name in modules:
               importlib.import_module(name)
@@ -343,6 +388,7 @@ jobs:
               torch.cat([src, dst]),
               torch.cat([dst, src]),
           ])
+
           graph = AddLaplacianEigenvectorPE(
               2, is_undirected=True
           )(Data(edge_index=edge_index, num_nodes=n))
@@ -445,10 +491,56 @@ jobs:
           import shutil
           import subprocess
           import sys
+          import sysconfig
           from pathlib import Path
+          from urllib.parse import urlsplit
 
           prefix = Path(sys.prefix).resolve()
           old = os.environ.get('MIRO_OLD_PREFIX', '')
+          site = Path(sysconfig.get_path('purelib')).resolve()
+
+          # Conda-built wheels can retain non-editable build-origin metadata.
+          # Accept it only when the metadata file is owned by a Conda package.
+          conda_owned = set()
+
+          for record_path in (prefix / 'conda-meta').glob('*.json'):
+              record = json.loads(record_path.read_text())
+              paths = list(record.get('files') or [])
+              paths_data = record.get('paths_data') or {}
+              paths.extend(
+                  p['_path']
+                  for p in paths_data.get('paths', [])
+                  if '_path' in p
+              )
+
+              for raw in paths:
+                  rel = Path(raw).as_posix()
+                  if rel.startswith('site-packages/'):
+                      rel = (
+                          site.relative_to(prefix)
+                          / rel[len('site-packages/'):]
+                      ).as_posix()
+                  conda_owned.add(rel)
+
+          # Standalone ldd may lack the importing extension's library search context.
+          # Supply wheel-private libraries to ldd only.
+          private_dirs = sorted(
+              p for p in site.rglob('*.libs') if p.is_dir()
+          )
+          search_dirs = [
+              prefix / 'lib',
+              site / 'torch' / 'lib',
+          ]
+          search_dirs.extend(sorted(
+              p for p in site.glob('nvidia/*/lib') if p.is_dir()
+          ))
+          search_dirs.extend(private_dirs)
+
+          ldd_env = os.environ.copy()
+          ldd_env.pop('LD_PRELOAD', None)
+          ldd_env['LD_LIBRARY_PATH'] = ':'.join(dict.fromkeys(
+              str(p) for p in search_dirs if p.is_dir()
+          ))
 
           glibc = {
               'libc.so.6', 'libm.so.6', 'libpthread.so.0', 'libdl.so.2',
@@ -464,6 +556,7 @@ jobs:
           errors = []
           external = set()
           seen = set()
+          provenance = []
 
           for p in prefix.rglob('*'):
               if p.is_symlink():
@@ -483,11 +576,17 @@ jobs:
 
               if p.name == 'direct_url.json':
                   data = json.loads(p.read_text())
-                  if (
-                      data.get('url', '').startswith('file:')
-                      or data.get('dir_info', {}).get('editable')
-                  ):
-                      errors.append('Local installation reference: ' + rel)
+
+                  if data.get('dir_info', {}).get('editable'):
+                      errors.append('Editable installation: ' + rel)
+
+                  elif urlsplit(data.get('url', '')).scheme == 'file':
+                      if rel in conda_owned:
+                          provenance.append(rel)
+                      else:
+                          errors.append(
+                              'Unmanaged local installation reference: ' + rel
+                          )
 
               with p.open('rb') as f:
                   head = f.read(4096)
@@ -511,6 +610,7 @@ jobs:
                       capture_output=True,
                       text=True,
                   ).stdout
+
                   if any(
                       old in line
                       for line in dynamic.splitlines()
@@ -522,9 +622,22 @@ jobs:
                   ['ldd', str(p)],
                   capture_output=True,
                   text=True,
+                  env=ldd_env,
               )
+              output = linked.stdout + '\n' + linked.stderr
 
-              for line in linked.stdout.splitlines():
+              if linked.returncode and not any(
+                  message in output
+                  for message in (
+                      'not a dynamic executable',
+                      'statically linked',
+                  )
+              ):
+                  errors.append(
+                      rel + ': ldd failed: ' + output.strip()
+                  )
+
+              for line in output.splitlines():
                   missing = re.match(r'\s*(\S+)\s+=>\s+not found', line)
                   if missing and missing[1] not in drivers:
                       errors.append(rel + ': ' + line.strip())
@@ -547,6 +660,16 @@ jobs:
           if errors:
               raise SystemExit('\n'.join(sorted(set(errors))))
 
+          if provenance:
+              print(
+                  'CONDA_BUILD_PROVENANCE_OK:',
+                  ', '.join(sorted(provenance)),
+              )
+
+          print(
+              'WHEEL_PRIVATE_LIB_DIRS:',
+              ', '.join(str(p.relative_to(prefix)) for p in private_dirs),
+          )
           print(
               'NATIVE_LIBS_OK; external OS/driver libraries:',
               ', '.join(sorted(external)),
