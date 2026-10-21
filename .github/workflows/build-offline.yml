@@ -65,7 +65,6 @@ jobs:
       - name: Check platform and workspace
         run: |
           set -euo pipefail
-
           test "$(uname -m)" = x86_64
           . /etc/os-release
           test "$ID:$VERSION_ID" = ubuntu:24.04
@@ -96,14 +95,8 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import base64
-          import concurrent.futures
-          import hashlib
-          import json
-          import os
-          import re
-          import urllib.parse
-          import urllib.request
+          import base64, concurrent.futures, hashlib, json, os, re
+          import urllib.parse, urllib.request
           from pathlib import Path
 
           repo = os.environ['PROJECT_REPO']
@@ -120,15 +113,8 @@ jobs:
                   return json.load(response)
 
           metadata = api('')
-          ref = (
-              metadata['default_branch']
-              if os.environ['PROJECT_REF'] == 'default'
-              else os.environ['PROJECT_REF']
-          )
-          commit = api(
-              '/commits/' + urllib.parse.quote(ref, safe='')
-          )['sha']
-
+          ref = metadata['default_branch'] if os.environ['PROJECT_REF'] == 'default' else os.environ['PROJECT_REF']
+          commit = api('/commits/' + urllib.parse.quote(ref, safe=''))['sha']
           print('Resolved upstream:', repo, ref, commit, flush=True)
 
           if commit != os.environ['AUDITED_COMMIT']:
@@ -152,8 +138,7 @@ jobs:
               }
           ]
           assert not configs, (
-              'New installation/LFS configuration requires review',
-              configs,
+              'New installation/LFS configuration requires review', configs
           )
           assert not any(
               e['path'].endswith(('.cu', '.cpp', '.cc', '.pyx'))
@@ -177,7 +162,6 @@ jobs:
               blob = api('/git/blobs/' + e['sha'])
               assert blob['encoding'] == 'base64'
               raw = base64.b64decode(blob['content'])
-
               actual = hashlib.sha1(
                   b'blob ' + str(len(raw)).encode() + b'\0' + raw
               ).hexdigest()
@@ -215,11 +199,9 @@ jobs:
               'resource_download_entry': 'lib.download.sdownload; not called',
               'notebook_progress': 'Use tqdm.tqdm instead of tqdm.tqdm_notebook in CLI scripts',
           }
-
           Path(os.environ['MIRO_WORK'], 'source-audit.json').write_text(
               json.dumps(audit, indent=2) + '\n'
           )
-
           print('SOURCE_AUDIT_OK:', len(records), 'text files; no source retained')
           PY
 
@@ -227,8 +209,8 @@ jobs:
         run: |
           set -euo pipefail
           unset PYTHONHOME PYTHONPATH
-
           cd "$MIRO_WORK"
+
           installer="Miniforge3-${MINIFORGE_VERSION}-Linux-x86_64.sh"
           url="https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}"
 
@@ -288,7 +270,22 @@ jobs:
           unset PYTHONHOME PYTHONPATH LD_PRELOAD CUDA_HOME CUDA_PATH
 
           if [[ -f "$_miro_prefix/bin/activate" ]]; then
-            source "$_miro_prefix/bin/activate"
+            # Preserve caller options while sourcing conda-pack's legacy script.
+            _miro_source_packed() {
+              local -
+              set +eu
+              source "$1"
+            }
+
+            _miro_activate_rc=0
+            _miro_source_packed "$_miro_prefix/bin/activate" || _miro_activate_rc=$?
+            unset -f _miro_source_packed
+
+            if (( _miro_activate_rc != 0 )); then
+              return "$_miro_activate_rc"
+            fi
+            unset _miro_activate_rc
+
           elif [[ "${CONDA_PREFIX:-}" != "$_miro_prefix" ]]; then
             echo 'Activate the build environment with conda activate first.' >&2
             return 1
@@ -315,13 +312,7 @@ jobs:
           SH
 
           cat > "$BUILD_PREFIX/_offline/verify.py" <<'PY'
-          import argparse
-          import importlib
-          import io
-          import json
-          import platform
-          import socket
-          import sys
+          import argparse, importlib, importlib.metadata, io, json, platform, socket, sys
           from pathlib import Path
 
           def no_network(*args, **kwargs):
@@ -342,21 +333,16 @@ jobs:
           assert '.'.join(map(str, sys.version_info[:2])) == config['python_series']
 
           modules = [
-              '_tkinter', 'numpy', 'matplotlib', 'torch', 'torchvision',
-              'lightning', 'pytorch_lightning', 'torchmetrics',
-              'torch_geometric', 'kornia', 'kornia_rs', 'scipy',
-              'skimage', 'sklearn', 'rich', 'dill', 'pandas', 'tqdm',
-              'requests',
+              '_tkinter', 'numpy', 'matplotlib', 'torch', 'torchvision', 'lightning',
+              'pytorch_lightning', 'torchmetrics', 'torch_geometric', 'kornia',
+              'kornia_rs', 'scipy', 'skimage', 'sklearn', 'rich', 'dill',
+              'pandas', 'tqdm', 'requests',
           ]
           for name in modules:
               importlib.import_module(name)
 
           import numpy as np
-          import torch
-          import torchvision
-          import kornia
-          import dill
-          import pandas as pd
+          import torch, torchvision, kornia, dill, pandas as pd
           import matplotlib.pyplot as plt
 
           from lightning.fabric.utilities.types import _PATH
@@ -395,8 +381,7 @@ jobs:
           assert graph.laplacian_eigenvector_pe.shape == (n, 2)
 
           reduced = scatter(
-              torch.ones(n), dst,
-              dim=0, dim_size=n, reduce='sum',
+              torch.ones(n), dst, dim=0, dim_size=n, reduce='sum'
           )
           assert reduced.sum().item() == n
 
@@ -409,9 +394,7 @@ jobs:
           assert torchvision.ops.nms(boxes, scores, 0.5).tolist() == [0, 2]
 
           blurred = kornia.filters.gaussian_blur2d(
-              torch.ones(1, 1, 8, 8),
-              (3, 3),
-              (1., 1.),
+              torch.ones(1, 1, 8, 8), (3, 3), (1., 1.)
           )
           assert blurred.shape == (1, 1, 8, 8)
 
@@ -458,9 +441,7 @@ jobs:
                   assert torch.allclose(conv, torch.full_like(conv, 18))
 
                   keep = torchvision.ops.nms(
-                      boxes.to(device),
-                      scores.to(device),
-                      0.5,
+                      boxes.to(device), scores.to(device), 0.5
                   )
                   assert keep.cpu().tolist() == [0, 2]
 
@@ -485,31 +466,22 @@ jobs:
           PY
 
           cat > "$BUILD_PREFIX/_offline/check-native.py" <<'PY'
-          import json
-          import os
-          import re
-          import shutil
-          import subprocess
-          import sys
-          import sysconfig
-          from pathlib import Path
+          import json, os, re, shutil, subprocess, sys, sysconfig
           from urllib.parse import urlsplit
+          from pathlib import Path
 
           prefix = Path(sys.prefix).resolve()
           old = os.environ.get('MIRO_OLD_PREFIX', '')
           site = Path(sysconfig.get_path('purelib')).resolve()
 
-          # Conda-built wheels can retain non-editable build-origin metadata.
-          # Accept it only when the metadata file is owned by a Conda package.
+          # Accept non-editable build-origin metadata only for Conda-owned files.
           conda_owned = set()
-
           for record_path in (prefix / 'conda-meta').glob('*.json'):
               record = json.loads(record_path.read_text())
               paths = list(record.get('files') or [])
               paths_data = record.get('paths_data') or {}
               paths.extend(
-                  p['_path']
-                  for p in paths_data.get('paths', [])
+                  p['_path'] for p in paths_data.get('paths', [])
                   if '_path' in p
               )
 
@@ -522,15 +494,11 @@ jobs:
                       ).as_posix()
                   conda_owned.add(rel)
 
-          # Standalone ldd may lack the importing extension's library search context.
-          # Supply wheel-private libraries to ldd only.
+          # Standalone ldd may lack the importing extension's search context.
           private_dirs = sorted(
               p for p in site.rglob('*.libs') if p.is_dir()
           )
-          search_dirs = [
-              prefix / 'lib',
-              site / 'torch' / 'lib',
-          ]
+          search_dirs = [prefix / 'lib', site / 'torch' / 'lib']
           search_dirs.extend(sorted(
               p for p in site.glob('nvidia/*/lib') if p.is_dir()
           ))
@@ -553,10 +521,7 @@ jobs:
               'libnvidia-ptxjitcompiler.so.1',
           }
 
-          errors = []
-          external = set()
-          seen = set()
-          provenance = []
+          errors, external, seen, provenance = [], set(), set(), []
 
           for p in prefix.rglob('*'):
               if p.is_symlink():
@@ -576,10 +541,8 @@ jobs:
 
               if p.name == 'direct_url.json':
                   data = json.loads(p.read_text())
-
                   if data.get('dir_info', {}).get('editable'):
                       errors.append('Editable installation: ' + rel)
-
                   elif urlsplit(data.get('url', '')).scheme == 'file':
                       if rel in conda_owned:
                           provenance.append(rel)
@@ -610,7 +573,6 @@ jobs:
                       capture_output=True,
                       text=True,
                   ).stdout
-
                   if any(
                       old in line
                       for line in dynamic.splitlines()
@@ -677,10 +639,7 @@ jobs:
           PY
 
           "$BUILD_PREFIX/bin/python" - <<'PY'
-          import json
-          import os
-          import platform
-          import sys
+          import json, os, platform, sys
           from pathlib import Path
 
           record = {
@@ -696,7 +655,6 @@ jobs:
               'conda_pack': os.environ['CONDA_PACK_VERSION'],
               'gpu_tested_on_runner': False,
           }
-
           Path(sys.prefix, '_offline', 'build.json').write_text(
               json.dumps(record, indent=2) + '\n'
           )
@@ -735,9 +693,10 @@ jobs:
           tar -xzf "$MIRO_WORK/out/$ARCHIVE_NAME" -C "$moved"
 
           unset PYTHONHOME PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD
-          source "$moved/bin/activate"
-          python "$moved/bin/conda-unpack"
           source "$moved/_offline/activate.sh"
+          python "$moved/bin/conda-unpack"
+          hash -r
+          echo ACTIVATION_AND_UNPACK_OK
 
           python -m pip check
           python "$moved/_offline/verify.py"
